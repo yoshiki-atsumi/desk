@@ -1,0 +1,193 @@
+"""
+extractor.py — 選挙公報から候補者情報を抽出するモジュール
+OpenAI Vision API (gpt-4o) を使用し、レイアウトに依存しない柔軟な抽出を行う。
+"""
+
+import base64
+import io
+import json
+import re
+import sys
+from pathlib import Path
+
+import openai
+from PIL import Image
+
+try:
+    import fitz  # PyMuPDF
+    HAS_FITZ = True
+except ImportError:
+    HAS_FITZ = False
+
+
+# ─────────────────────────────────────────
+# プロンプト定義
+# ─────────────────────────────────────────
+
+SYSTEM_PROMPT = """あなたは選挙公報（選挙広報）の解析専門家です。
+画像から候補者情報を正確に抽出し、必ず指定のJSON形式のみで回答してください。
+レイアウトがバラバラでも柔軟に対応してください。コードブロックや説明文は不要です。"""
+
+EXTRACTION_PROMPT = """この選挙公報の画像を解析し、候補者情報を以下のJSON形式で抽出してください。
+
+出力形式（純粋なJSONのみ。コードブロック・説明文は不要）:
+{
+  "candidates": [
+    {
+      "name": "候補者名（判読不能な場合は「不明_1」のように連番付きで）",
+      "party": "政党名（検出できない場合はnull）",
+      "profile": "経歴・学歴・肩書き・自己紹介など人物情報のテキスト（政策は含めない）",
+      "policies": [
+        "政策・公約・主張の項目1",
+        "政策・公約・主張の項目2"
+      ],
+      "needs_review": false
+    }
+  ]
+}
+
+抽出ルール:
+- プロフィールと政策は必ず分けること（混在させない）
+- 政策は1項目ずつ配列に格納する
+- OCRが不鮮明・読み取り困難な箇所がある場合は needs_review: true にする
+- 候補者が見当たらない場合は candidates: [] を返す
+- 同一ページに複数候補者がいる場合はすべて抽出する"""
+
+
+# ─────────────────────────────────────────
+# ヘルパー関数
+# ─────────────────────────────────────────
+
+def _resize_image(img: Image.Image, max_side: int = 1568) -> Image.Image:
+    """画像を OpenAI Vision の推奨最大サイズ以内にリサイズ"""
+    w, h = img.size
+    if max(w, h) <= max_side:
+        return img
+    ratio = max_side / max(w, h)
+    return img.resize((int(w * ratio), int(h * ratio)), Image.LANCZOS)
+
+
+def _image_to_base64(img: Image.Image) -> str:
+    """PIL 画像を data URL 形式の base64 文字列に変換"""
+    buf = io.BytesIO()
+    img = img.convert("RGB")
+    img.save(buf, format="JPEG", quality=90)
+    data = base64.standard_b64encode(buf.getvalue()).decode()
+    return f"data:image/jpeg;base64,{data}"
+
+
+def _parse_json_response(text: str) -> dict:
+    """レスポンステキストから JSON を抽出してパース"""
+    # コードブロック除去
+    text = re.sub(r"```(?:json)?\s*\n?", "", text)
+    text = re.sub(r"\n?```", "", text)
+    # JSON オブジェクト部分を抽出
+    match = re.search(r"\{.*\}", text, re.DOTALL)
+    if match:
+        return json.loads(match.group())
+    return json.loads(text.strip())
+
+
+# ─────────────────────────────────────────
+# 抽出コア
+# ─────────────────────────────────────────
+
+def _extract_from_image(
+    client: openai.OpenAI,
+    img: Image.Image,
+    source_file: str,
+    page_num: int,
+    unknown_counter: list[int],
+) -> list[dict]:
+    """単一画像から候補者情報を抽出して返す"""
+    img = _resize_image(img)
+    image_url = _image_to_base64(img)
+
+    try:
+        response = client.chat.completions.create(
+            model="gpt-4o",
+            max_tokens=4096,
+            messages=[
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": image_url, "detail": "high"},
+                        },
+                        {"type": "text", "text": EXTRACTION_PROMPT},
+                    ],
+                },
+            ],
+        )
+        text = response.choices[0].message.content or ""
+        parsed = _parse_json_response(text)
+        candidates = parsed.get("candidates", [])
+
+    except (json.JSONDecodeError, Exception) as e:
+        print(f"\n  ⚠ 抽出エラー ({source_file} p.{page_num}): {e}", file=sys.stderr)
+        candidates = [{
+            "name": f"不明_{unknown_counter[0]}",
+            "party": None,
+            "profile": "",
+            "policies": [],
+            "needs_review": True,
+        }]
+        unknown_counter[0] += 1
+
+    # 「不明」候補者に連番を割り当て・共通フィールドを付与
+    for cand in candidates:
+        name = cand.get("name", "")
+        if not name or re.match(r"^不明", name):
+            cand["name"] = f"不明_{unknown_counter[0]}"
+            unknown_counter[0] += 1
+        cand.setdefault("party", None)
+        cand.setdefault("profile", "")
+        cand.setdefault("policies", [])
+        cand.setdefault("needs_review", False)
+        cand["source_file"] = source_file
+        cand["source_page"] = page_num
+
+    return candidates
+
+
+# ─────────────────────────────────────────
+# ファイル処理
+# ─────────────────────────────────────────
+
+def process_file(
+    file_path: Path,
+    client: openai.OpenAI,
+    unknown_counter: list[int],
+) -> list[dict]:
+    """1ファイル（PDF/画像）を処理して候補者リストを返す"""
+    suffix = file_path.suffix.lower()
+
+    if suffix == ".pdf":
+        if not HAS_FITZ:
+            print("  ⚠ PyMuPDF 未インストール。PDF をスキップします。", file=sys.stderr)
+            return []
+        doc = fitz.open(str(file_path))
+        results = []
+        for page_idx, page in enumerate(doc):
+            page_num = page_idx + 1
+            print(f"    ページ {page_num}/{len(doc)} ...", end=" ", flush=True)
+            pix = page.get_pixmap(dpi=150)
+            img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+            cands = _extract_from_image(client, img, file_path.name, page_num, unknown_counter)
+            print(f"{len(cands)} 名")
+            results.extend(cands)
+        doc.close()
+        return results
+
+    elif suffix in (".jpg", ".jpeg", ".png"):
+        print(f"    画像処理中 ...", end=" ", flush=True)
+        img = Image.open(file_path)
+        cands = _extract_from_image(client, img, file_path.name, 1, unknown_counter)
+        print(f"{len(cands)} 名")
+        return cands
+
+    else:
+        print(f"  ⚠ 未対応形式: {suffix}（スキップ）", file=sys.stderr)
+        return []
