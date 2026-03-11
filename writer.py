@@ -34,7 +34,7 @@ def write_json(candidates: list[dict], output_dir: Path) -> None:
 
 def write_csv(candidates: list[dict], output_dir: Path) -> None:
     path = output_dir / "candidates.csv"
-    fieldnames = ["候補者名", "政党", "プロフィール", "政策テキスト", "元ファイル", "ページ", "要確認"]
+    fieldnames = ["候補者名", "年齢", "政党", "キャッチフレーズ", "プロフィール", "政策テキスト", "その他", "全文", "元ファイル", "ページ", "要確認"]
 
     with path.open("w", newline="", encoding="utf-8-sig") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
@@ -42,9 +42,13 @@ def write_csv(candidates: list[dict], output_dir: Path) -> None:
         for c in candidates:
             writer.writerow({
                 "候補者名": c.get("name", ""),
+                "年齢": c.get("age") or "",
                 "政党": c.get("party") or "",
+                "キャッチフレーズ": c.get("catchphrase") or "",
                 "プロフィール": c.get("profile", ""),
                 "政策テキスト": "\n".join(c.get("policies", [])),
+                "その他": c.get("other") or "",
+                "全文": c.get("raw_text", ""),
                 "元ファイル": c.get("source_file", ""),
                 "ページ": c.get("source_page", ""),
                 "要確認": "○" if c.get("needs_review") else "",
@@ -70,15 +74,24 @@ def write_markdown(candidates: list[dict], output_dir: Path) -> None:
             if c.get("needs_review")
             else ""
         )
+        age = c.get("age")
+        catchphrase = c.get("catchphrase") or ""
+        other = c.get("other") or ""
+        raw_text = c.get("raw_text") or ""
+
         header = (
-            f"**政党**: {party}\n\n" if party else ""
-        ) + f"**出典**: {source}\n{review_note}\n---\n\n"
+            (f"**政党**: {party}\n\n" if party else "")
+            + (f"**年齢**: {age}歳\n\n" if age else "")
+            + f"**出典**: {source}\n{review_note}\n---\n\n"
+        )
 
         # profile.md
         profile_md = (
             f"# {name} — プロフィール\n\n"
             + header
+            + (f"> {catchphrase}\n\n" if catchphrase else "")
             + (c.get("profile") or "（プロフィール情報なし）")
+            + ("\n\n---\n\n## その他\n\n" + other if other else "")
             + "\n"
         )
         (cands_dir / f"{safe}_profile.md").write_text(profile_md, encoding="utf-8")
@@ -98,6 +111,16 @@ def write_markdown(candidates: list[dict], output_dir: Path) -> None:
         )
         (cands_dir / f"{safe}_policies.md").write_text(policies_md, encoding="utf-8")
 
+        # raw.md（全文そのまま）
+        if raw_text:
+            raw_md = (
+                f"# {name} — 全文（原文）\n\n"
+                + header
+                + raw_text
+                + "\n"
+            )
+            (cands_dir / f"{safe}_raw.md").write_text(raw_md, encoding="utf-8")
+
     print(f"  → {cands_dir}/ （{len(candidates)} 名分）")
 
 
@@ -113,14 +136,24 @@ def write_index(candidates: list[dict], output_dir: Path) -> None:
     for c in candidates:
         name = c.get("name", "不明")
         party = c.get("party") or "（政党不明）"
+        age = c.get("age")
+        catchphrase = c.get("catchphrase") or ""
         safe = _safe_filename(name)
         review = " ⚠" if c.get("needs_review") else ""
+        has_raw = bool(c.get("raw_text"))
+        raw_link = (
+            f"- **全文**: [candidates/{safe}_raw.md](candidates/{safe}_raw.md)\n"
+            if has_raw else ""
+        )
         lines.append(
             f"## {name}{review}\n"
-            f"- **政党**: {party}\n"
-            f"- **プロフィール**: [candidates/{safe}_profile.md](candidates/{safe}_profile.md)\n"
+            + (f"> {catchphrase}\n\n" if catchphrase else "")
+            + f"- **政党**: {party}\n"
+            + (f"- **年齢**: {age}歳\n" if age else "")
+            + f"- **プロフィール**: [candidates/{safe}_profile.md](candidates/{safe}_profile.md)\n"
             f"- **政策**: [candidates/{safe}_policies.md](candidates/{safe}_policies.md)\n"
-            f"- **出典**: {c.get('source_file', '')} p.{c.get('source_page', '')}\n"
+            + raw_link
+            + f"- **出典**: {c.get('source_file', '')} p.{c.get('source_page', '')}\n"
         )
 
     path.write_text("\n".join(lines), encoding="utf-8")
