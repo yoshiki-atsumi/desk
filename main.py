@@ -9,9 +9,16 @@ JSON / CSV / Markdown 形式で出力します。
   3. python main.py
 """
 
+import io
 import os
 import sys
 from pathlib import Path
+
+# Windowsコンソールの文字化け対策
+if sys.stdout.encoding != "utf-8":
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
+if sys.stderr.encoding != "utf-8":
+    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace")
 
 import openai
 from dotenv import load_dotenv

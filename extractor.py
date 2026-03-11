@@ -38,7 +38,7 @@ EXTRACTION_PROMPT = """この選挙公報の画像を解析し、候補者情報
     {
       "name": "候補者名（判読不能な場合は「不明_1」のように連番付きで）",
       "party": "政党名（検出できない場合はnull）",
-      "age": 候補者の年齢（数値。記載なければnull）,
+      "age": 45,
       "catchphrase": "キャッチフレーズ・スローガン・見出し的な短いフレーズ（なければnull）",
       "profile": "経歴・学歴・肩書き・自己紹介など人物情報のテキスト（政策・キャッチフレーズは含めない）",
       "policies": [
@@ -54,6 +54,8 @@ EXTRACTION_PROMPT = """この選挙公報の画像を解析し、候補者情報
 
 抽出ルール:
 - 【最重要】raw_text には候補者欄の全テキストを一字一句そのまま含める。省略・要約は絶対にしない
+- raw_text 内の改行は必ず \\n（バックスラッシュ+n）でエスケープし、JSONが壊れないようにする
+- raw_text 内のダブルクォートは \\" でエスケープする
 - プロフィール・キャッチフレーズ・政策・その他は必ず分けること
 - 政策は1項目ずつ配列に格納する（箇条書き・見出しの粒度で分割）
 - catchphrase: 大きく強調されたフレーズ、スローガン、キャッチコピー
@@ -126,7 +128,7 @@ def _call_api(
     """Vision API を呼び出してテキストを返す"""
     response = client.chat.completions.create(
         model="gpt-4o",
-        max_tokens=4096,
+        max_tokens=8192,
         temperature=0,
         response_format={"type": "json_object"},
         messages=[
@@ -162,36 +164,50 @@ def _extract_from_image(
     img = _resize_image(img)
     image_url = _image_to_base64(img)
 
+    candidates = None
+
+    # 1回目の試行
     try:
         text = _call_api(client, image_url, EXTRACTION_PROMPT)
         parsed = _parse_json_response(text)
         candidates = parsed.get("candidates", [])
+    except (json.JSONDecodeError, Exception) as e:
+        print(f"\n    ↺ パース失敗、再試行中... ({e})", end=" ", flush=True)
 
-        # needs_review がある場合はリトライ
-        if any(c.get("needs_review") for c in candidates):
+    # パース失敗 or needs_review がある場合はリトライ
+    if candidates is None or any(c.get("needs_review") for c in candidates):
+        if candidates is not None:
             print(f"\n    ↺ 精度不足を検出、再抽出中...", end=" ", flush=True)
+        try:
             retry_text = _call_api(client, image_url, RETRY_PROMPT)
             retry_parsed = _parse_json_response(retry_text)
             retry_candidates = retry_parsed.get("candidates", [])
-            # リトライ結果の方が候補者数が多いか、needs_reviewが減った場合は採用
-            retry_needs_review = sum(1 for c in retry_candidates if c.get("needs_review"))
-            orig_needs_review = sum(1 for c in candidates if c.get("needs_review"))
-            if retry_candidates and retry_needs_review <= orig_needs_review:
+            if candidates is None:
                 candidates = retry_candidates
-                print("改善")
+                print("完了")
             else:
-                print("変化なし")
-
-    except (json.JSONDecodeError, Exception) as e:
-        print(f"\n  ⚠ 抽出エラー ({source_file} p.{page_num}): {e}", file=sys.stderr)
-        candidates = [{
-            "name": f"不明_{unknown_counter[0]}",
-            "party": None,
-            "profile": "",
-            "policies": [],
-            "needs_review": True,
-        }]
-        unknown_counter[0] += 1
+                retry_needs_review = sum(1 for c in retry_candidates if c.get("needs_review"))
+                orig_needs_review = sum(1 for c in candidates if c.get("needs_review"))
+                if retry_candidates and retry_needs_review <= orig_needs_review:
+                    candidates = retry_candidates
+                    print("改善")
+                else:
+                    print("変化なし")
+        except (json.JSONDecodeError, Exception) as e2:
+            print(f"\n  ⚠ 抽出エラー ({source_file} p.{page_num}): {e2}", file=sys.stderr)
+            if candidates is None:
+                candidates = [{
+                    "name": f"不明_{unknown_counter[0]}",
+                    "party": None,
+                    "age": None,
+                    "catchphrase": None,
+                    "profile": "",
+                    "policies": [],
+                    "other": None,
+                    "raw_text": "",
+                    "needs_review": True,
+                }]
+                unknown_counter[0] += 1
 
     # 「不明」候補者に連番を割り当て・共通フィールドを付与
     for cand in candidates:
