@@ -38,7 +38,11 @@ def main() -> None:
     api_key = os.getenv("OPENAI_API_KEY")
     if not api_key:
         print("エラー: OPENAI_API_KEY が設定されていません。", file=sys.stderr)
-        print(".env ファイルを作成し、OPENAI_API_KEY=sk-... を記載してください。", file=sys.stderr)
+        sys.exit(1)
+
+    google_api_key = os.getenv("GOOGLE_API_KEY")
+    if not google_api_key:
+        print("エラー: GOOGLE_API_KEY が設定されていません。", file=sys.stderr)
         sys.exit(1)
 
     client = openai.OpenAI(api_key=api_key)
@@ -64,9 +68,14 @@ def main() -> None:
     print("=" * 50)
     print(f"対象ファイル: {len(files)} 件\n")
 
-    # 出力フォルダ準備
+    # 出力フォルダ準備（candidatesフォルダは毎回クリア）
     OUTPUT_DIR.mkdir(exist_ok=True)
-    (OUTPUT_DIR / "candidates").mkdir(exist_ok=True)
+    cands_dir = OUTPUT_DIR / "candidates"
+    if cands_dir.exists():
+        for f in cands_dir.iterdir():
+            f.unlink()
+    else:
+        cands_dir.mkdir()
 
     # 全ファイル処理
     all_candidates: list[dict] = []
@@ -75,7 +84,7 @@ def main() -> None:
     for i, file_path in enumerate(files, start=1):
         print(f"[{i}/{len(files)}] {file_path.name}")
         try:
-            candidates = process_file(file_path, client, unknown_counter)
+            candidates = process_file(file_path, client, google_api_key, unknown_counter)
             all_candidates.extend(candidates)
             print(f"  ✓ {len(candidates)} 名を抽出")
         except Exception as e:
