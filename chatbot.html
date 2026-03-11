@@ -1,0 +1,588 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>AIボートマッチ — 菊川市議会議員選挙</title>
+  <style>
+    :root {
+      --primary: #1a3a6b;
+      --primary-light: #2a5298;
+      --accent: #e8a020;
+      --bg: #f4f6fb;
+      --surface: #ffffff;
+      --border: #dde3f0;
+      --text: #1a1a2e;
+      --text-muted: #6b7280;
+      --user-bubble: #1a3a6b;
+      --ai-bubble: #ffffff;
+      --radius: 12px;
+    }
+
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      font-family: 'Hiragino Sans', 'Meiryo', sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      height: 100dvh;
+      display: flex;
+      flex-direction: column;
+    }
+
+    /* ── ヘッダー ── */
+    header {
+      background: var(--primary);
+      color: white;
+      padding: 12px 20px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      flex-shrink: 0;
+      box-shadow: 0 2px 8px rgba(0,0,0,0.2);
+    }
+    .header-left { display: flex; align-items: center; gap: 12px; }
+    .logo {
+      background: var(--accent);
+      color: white;
+      font-weight: 800;
+      font-size: 11px;
+      padding: 4px 8px;
+      border-radius: 6px;
+      letter-spacing: 0.5px;
+    }
+    header h1 { font-size: 18px; font-weight: 700; }
+    header p  { font-size: 12px; opacity: 0.75; margin-top: 1px; }
+    .api-btn {
+      background: rgba(255,255,255,0.15);
+      border: 1px solid rgba(255,255,255,0.3);
+      color: white;
+      padding: 6px 14px;
+      border-radius: 20px;
+      font-size: 12px;
+      cursor: pointer;
+      transition: background 0.2s;
+      white-space: nowrap;
+    }
+    .api-btn:hover { background: rgba(255,255,255,0.25); }
+
+    /* ── メインレイアウト ── */
+    .main {
+      display: flex;
+      flex: 1;
+      overflow: hidden;
+    }
+
+    /* ── サイドバー ── */
+    .sidebar {
+      width: 220px;
+      background: var(--surface);
+      border-right: 1px solid var(--border);
+      display: flex;
+      flex-direction: column;
+      flex-shrink: 0;
+      overflow: hidden;
+    }
+    .sidebar-title {
+      padding: 12px 14px;
+      font-size: 11px;
+      font-weight: 700;
+      color: var(--text-muted);
+      text-transform: uppercase;
+      letter-spacing: 0.8px;
+      border-bottom: 1px solid var(--border);
+      background: var(--bg);
+    }
+    .candidate-list {
+      overflow-y: auto;
+      flex: 1;
+    }
+    .candidate-item {
+      padding: 10px 14px;
+      cursor: pointer;
+      border-bottom: 1px solid var(--border);
+      transition: background 0.15s;
+    }
+    .candidate-item:hover { background: #eef2fb; }
+    .candidate-item.active { background: #dde8fb; border-left: 3px solid var(--primary-light); }
+    .candidate-name { font-size: 14px; font-weight: 600; }
+    .candidate-party {
+      font-size: 11px;
+      color: var(--text-muted);
+      margin-top: 2px;
+    }
+
+    /* ── チャットエリア ── */
+    .chat-area {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+    }
+
+    .quick-bar {
+      padding: 10px 16px;
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+      border-bottom: 1px solid var(--border);
+      background: var(--surface);
+      flex-shrink: 0;
+    }
+    .quick-btn {
+      background: var(--bg);
+      border: 1px solid var(--border);
+      color: var(--primary);
+      padding: 5px 12px;
+      border-radius: 20px;
+      font-size: 12px;
+      cursor: pointer;
+      transition: all 0.2s;
+    }
+    .quick-btn:hover {
+      background: var(--primary);
+      color: white;
+      border-color: var(--primary);
+    }
+
+    .messages {
+      flex: 1;
+      overflow-y: auto;
+      padding: 20px 16px;
+      display: flex;
+      flex-direction: column;
+      gap: 16px;
+    }
+
+    /* ── メッセージバブル ── */
+    .message { display: flex; gap: 10px; max-width: 85%; }
+    .message.user { align-self: flex-end; flex-direction: row-reverse; }
+    .message.ai   { align-self: flex-start; }
+
+    .avatar {
+      width: 32px; height: 32px;
+      border-radius: 50%;
+      display: flex; align-items: center; justify-content: center;
+      font-size: 14px;
+      flex-shrink: 0;
+    }
+    .ai .avatar   { background: var(--primary); color: white; font-weight: 700; font-size: 11px; }
+    .user .avatar { background: var(--accent);  color: white; font-size: 14px; }
+
+    .bubble {
+      padding: 11px 15px;
+      border-radius: var(--radius);
+      font-size: 14px;
+      line-height: 1.7;
+      white-space: pre-wrap;
+    }
+    .ai .bubble {
+      background: var(--ai-bubble);
+      border: 1px solid var(--border);
+      border-top-left-radius: 4px;
+      box-shadow: 0 1px 4px rgba(0,0,0,0.06);
+    }
+    .user .bubble {
+      background: var(--user-bubble);
+      color: white;
+      border-top-right-radius: 4px;
+    }
+
+    .typing {
+      display: flex; gap: 4px; align-items: center;
+      padding: 4px 0;
+    }
+    .typing span {
+      width: 7px; height: 7px;
+      background: var(--text-muted);
+      border-radius: 50%;
+      animation: bounce 1.2s infinite;
+    }
+    .typing span:nth-child(2) { animation-delay: 0.2s; }
+    .typing span:nth-child(3) { animation-delay: 0.4s; }
+    @keyframes bounce {
+      0%, 60%, 100% { transform: translateY(0); }
+      30%           { transform: translateY(-6px); }
+    }
+
+    /* ── 入力欄 ── */
+    .input-area {
+      padding: 12px 16px;
+      border-top: 1px solid var(--border);
+      background: var(--surface);
+      display: flex;
+      gap: 10px;
+      align-items: flex-end;
+      flex-shrink: 0;
+    }
+    textarea {
+      flex: 1;
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 10px 14px;
+      font-size: 14px;
+      font-family: inherit;
+      resize: none;
+      outline: none;
+      max-height: 120px;
+      line-height: 1.5;
+      transition: border-color 0.2s;
+    }
+    textarea:focus { border-color: var(--primary-light); }
+    .send-btn {
+      background: var(--primary);
+      color: white;
+      border: none;
+      width: 40px; height: 40px;
+      border-radius: 10px;
+      cursor: pointer;
+      font-size: 18px;
+      display: flex; align-items: center; justify-content: center;
+      transition: background 0.2s;
+      flex-shrink: 0;
+    }
+    .send-btn:hover:not(:disabled) { background: var(--primary-light); }
+    .send-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+
+    /* ── モーダル ── */
+    .modal-overlay {
+      position: fixed; inset: 0;
+      background: rgba(0,0,0,0.5);
+      display: flex; align-items: center; justify-content: center;
+      z-index: 100;
+    }
+    .modal-overlay.hidden { display: none; }
+    .modal {
+      background: white;
+      border-radius: var(--radius);
+      padding: 28px;
+      width: 380px;
+      max-width: 90vw;
+      box-shadow: 0 8px 32px rgba(0,0,0,0.15);
+    }
+    .modal h2 { font-size: 18px; margin-bottom: 8px; }
+    .modal p  { font-size: 13px; color: var(--text-muted); margin-bottom: 16px; line-height: 1.6; }
+    .modal input {
+      width: 100%;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 10px 12px;
+      font-size: 14px;
+      outline: none;
+      margin-bottom: 12px;
+    }
+    .modal input:focus { border-color: var(--primary-light); }
+    .modal-actions { display: flex; gap: 8px; justify-content: flex-end; }
+    .btn-primary {
+      background: var(--primary);
+      color: white;
+      border: none;
+      padding: 9px 20px;
+      border-radius: 8px;
+      font-size: 14px;
+      cursor: pointer;
+    }
+    .btn-secondary {
+      background: var(--bg);
+      color: var(--text);
+      border: 1px solid var(--border);
+      padding: 9px 20px;
+      border-radius: 8px;
+      font-size: 14px;
+      cursor: pointer;
+    }
+
+    /* ── ウェルカムメッセージ ── */
+    .welcome {
+      background: linear-gradient(135deg, #eef2fb, #f4f6fb);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 16px 18px;
+      font-size: 14px;
+      line-height: 1.8;
+      align-self: center;
+      max-width: 480px;
+      margin: auto;
+      text-align: center;
+    }
+    .welcome h2 { color: var(--primary); margin-bottom: 8px; font-size: 16px; }
+    .welcome p  { color: var(--text-muted); }
+
+    /* ── スクロールバー ── */
+    ::-webkit-scrollbar { width: 5px; }
+    ::-webkit-scrollbar-track { background: transparent; }
+    ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+
+    @media (max-width: 600px) {
+      .sidebar { display: none; }
+      header h1 { font-size: 15px; }
+    }
+  </style>
+</head>
+<body>
+
+<!-- ヘッダー -->
+<header>
+  <div class="header-left">
+    <div class="logo">AI</div>
+    <div>
+      <h1>ボートマッチ</h1>
+      <p>菊川市議会議員選挙 2025</p>
+    </div>
+  </div>
+  <button class="api-btn" onclick="openApiModal()">⚙ APIキー設定</button>
+</header>
+
+<!-- メインレイアウト -->
+<div class="main">
+
+  <!-- 候補者サイドバー -->
+  <aside class="sidebar">
+    <div class="sidebar-title">候補者一覧</div>
+    <div class="candidate-list" id="candidateList"></div>
+  </aside>
+
+  <!-- チャットエリア -->
+  <div class="chat-area">
+    <div class="quick-bar">
+      <button class="quick-btn" onclick="quickAsk('全候補者を一覧で教えてください')">👥 候補者一覧</button>
+      <button class="quick-btn" onclick="quickAsk('子育て・教育に力を入れている候補者は誰ですか？')">👶 子育て・教育</button>
+      <button class="quick-btn" onclick="quickAsk('防災・安全に力を入れている候補者は誰ですか？')">🛡 防災</button>
+      <button class="quick-btn" onclick="quickAsk('経済・産業振興に取り組む候補者は誰ですか？')">💼 経済・産業</button>
+      <button class="quick-btn" onclick="quickAsk('高齢者・福祉に関する政策を持つ候補者は誰ですか？')">🤝 福祉</button>
+    </div>
+
+    <div class="messages" id="messages">
+      <div class="welcome">
+        <h2>ようこそ、AIボートマッチへ</h2>
+        <p>候補者の政策・プロフィールについて、自由に質問できます。<br>気になるテーマや候補者について聞いてみてください。</p>
+      </div>
+    </div>
+
+    <div class="input-area">
+      <textarea id="input" placeholder="質問を入力してください（例：環境問題に取り組む候補者は？）" rows="1"
+        onkeydown="handleKey(event)" oninput="autoResize(this)"></textarea>
+      <button class="send-btn" id="sendBtn" onclick="sendMessage()">↑</button>
+    </div>
+  </div>
+</div>
+
+<!-- APIキー設定モーダル -->
+<div class="modal-overlay hidden" id="apiModal">
+  <div class="modal">
+    <h2>OpenAI APIキーの設定</h2>
+    <p>チャットボットの利用にはOpenAI APIキーが必要です。<br>キーはこのブラウザにのみ保存されます。</p>
+    <input type="password" id="apiKeyInput" placeholder="sk-..." />
+    <div class="modal-actions">
+      <button class="btn-secondary" onclick="closeApiModal()">キャンセル</button>
+      <button class="btn-primary" onclick="saveApiKey()">保存</button>
+    </div>
+  </div>
+</div>
+
+<script>
+// ── データ ──────────────────────────────
+let candidates = [];
+
+async function loadCandidates() {
+  try {
+    const res = await fetch('output/candidates.json');
+    const data = await res.json();
+    candidates = data.candidates;
+    renderSidebar();
+  } catch (e) {
+    console.warn('candidates.json の読み込み失敗:', e);
+  }
+}
+
+function renderSidebar() {
+  const list = document.getElementById('candidateList');
+  list.innerHTML = candidates.map((c, i) => `
+    <div class="candidate-item" onclick="quickAsk('${c.name}さんについて教えてください')" data-i="${i}">
+      <div class="candidate-name">${c.name}</div>
+      <div class="candidate-party">${c.party || '無所属'}</div>
+    </div>
+  `).join('');
+}
+
+// ── システムプロンプト ───────────────────
+function buildSystemPrompt() {
+  const info = candidates.map(c => {
+    const policies = c.policies.map(p => `  ・${p}`).join('\n');
+    return [
+      `【${c.name}】`,
+      `政党: ${c.party || '無所属'}`,
+      `プロフィール: ${c.profile || '記載なし'}`,
+      `政策・公約:\n${policies || '  記載なし'}`,
+      c.other ? `その他: ${c.other}` : null,
+    ].filter(Boolean).join('\n');
+  }).join('\n\n');
+
+  return `あなたは「AIボートマッチ」のアシスタントです。菊川市議会議員選挙（令和7年1月26日執行）の候補者情報をもとに、有権者が投票先を考える際のサポートをします。
+
+【重要な原則】
+- 特定の候補者を推薦したり、他の候補者を否定したりしない
+- 候補者データに書かれていないことは答えない（憶測・補完しない）
+- 公平・中立な立場を常に保つ
+- 情報の出典は「選挙公報」であることを適宜伝える
+
+【候補者データ（選挙公報より）】
+${info}`;
+}
+
+// ── チャット ────────────────────────────
+const messages = [];
+let isLoading = false;
+
+function addMessage(role, text) {
+  const container = document.getElementById('messages');
+
+  // ウェルカムを消す
+  const welcome = container.querySelector('.welcome');
+  if (welcome) welcome.remove();
+
+  const div = document.createElement('div');
+  div.className = `message ${role}`;
+
+  const avatar = document.createElement('div');
+  avatar.className = 'avatar';
+  avatar.textContent = role === 'ai' ? 'AI' : '👤';
+
+  const bubble = document.createElement('div');
+  bubble.className = 'bubble';
+  bubble.textContent = text;
+
+  div.appendChild(avatar);
+  div.appendChild(bubble);
+  container.appendChild(div);
+  container.scrollTop = container.scrollHeight;
+  return bubble;
+}
+
+function addTyping() {
+  const container = document.getElementById('messages');
+  const div = document.createElement('div');
+  div.className = 'message ai';
+  div.id = 'typing';
+
+  const avatar = document.createElement('div');
+  avatar.className = 'avatar';
+  avatar.textContent = 'AI';
+
+  const bubble = document.createElement('div');
+  bubble.className = 'bubble';
+  bubble.innerHTML = '<div class="typing"><span></span><span></span><span></span></div>';
+
+  div.appendChild(avatar);
+  div.appendChild(bubble);
+  container.appendChild(div);
+  container.scrollTop = container.scrollHeight;
+}
+
+function removeTyping() {
+  const t = document.getElementById('typing');
+  if (t) t.remove();
+}
+
+async function sendMessage(text) {
+  const input = document.getElementById('input');
+  const userText = text || input.value.trim();
+  if (!userText || isLoading) return;
+
+  const apiKey = localStorage.getItem('openai_api_key');
+  if (!apiKey) {
+    openApiModal();
+    return;
+  }
+
+  input.value = '';
+  autoResize(input);
+  addMessage('user', userText);
+  messages.push({ role: 'user', content: userText });
+
+  isLoading = true;
+  document.getElementById('sendBtn').disabled = true;
+  addTyping();
+
+  try {
+    const res = await fetch('https://api.openai.com/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${apiKey}`,
+      },
+      body: JSON.stringify({
+        model: 'gpt-4o',
+        temperature: 0,
+        messages: [
+          { role: 'system', content: buildSystemPrompt() },
+          ...messages,
+        ],
+      }),
+    });
+
+    const data = await res.json();
+    removeTyping();
+
+    if (data.error) {
+      addMessage('ai', `エラー: ${data.error.message}`);
+    } else {
+      const reply = data.choices[0].message.content;
+      addMessage('ai', reply);
+      messages.push({ role: 'assistant', content: reply });
+    }
+  } catch (e) {
+    removeTyping();
+    addMessage('ai', 'ネットワークエラーが発生しました。APIキーとインターネット接続を確認してください。');
+  }
+
+  isLoading = false;
+  document.getElementById('sendBtn').disabled = false;
+}
+
+function quickAsk(text) {
+  document.getElementById('input').value = text;
+  sendMessage(text);
+}
+
+// ── 入力欄 ──────────────────────────────
+function handleKey(e) {
+  if (e.key === 'Enter' && !e.shiftKey) {
+    e.preventDefault();
+    sendMessage();
+  }
+}
+
+function autoResize(el) {
+  el.style.height = 'auto';
+  el.style.height = Math.min(el.scrollHeight, 120) + 'px';
+}
+
+// ── APIキーモーダル ──────────────────────
+function openApiModal() {
+  const key = localStorage.getItem('openai_api_key') || '';
+  document.getElementById('apiKeyInput').value = key;
+  document.getElementById('apiModal').classList.remove('hidden');
+}
+function closeApiModal() {
+  document.getElementById('apiModal').classList.add('hidden');
+}
+function saveApiKey() {
+  const key = document.getElementById('apiKeyInput').value.trim();
+  if (key) {
+    localStorage.setItem('openai_api_key', key);
+    closeApiModal();
+  }
+}
+
+// ── 初期化 ──────────────────────────────
+loadCandidates();
+
+// APIキー未設定なら起動時にモーダル表示
+if (!localStorage.getItem('openai_api_key')) {
+  setTimeout(openApiModal, 500);
+}
+</script>
+</body>
+</html>
