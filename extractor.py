@@ -11,7 +11,7 @@ import sys
 from pathlib import Path
 
 import openai
-from PIL import Image
+from PIL import Image, ImageEnhance, ImageFilter
 
 try:
     import fitz  # PyMuPDF
@@ -26,7 +26,8 @@ except ImportError:
 
 SYSTEM_PROMPT = """あなたは選挙公報（選挙広報）の解析専門家です。
 画像から候補者情報を正確に抽出し、必ず指定のJSON形式のみで回答してください。
-レイアウトがバラバラでも柔軟に対応してください。コードブロックや説明文は不要です。"""
+レイアウトがバラバラでも柔軟に対応してください。コードブロックや説明文は不要です。
+日本語のOCRに慣れており、手書き・印刷・縦書き・横書きいずれにも対応できます。"""
 
 EXTRACTION_PROMPT = """この選挙公報の画像を解析し、候補者情報を以下のJSON形式で抽出してください。
 
@@ -48,17 +49,38 @@ EXTRACTION_PROMPT = """この選挙公報の画像を解析し、候補者情報
 
 抽出ルール:
 - プロフィールと政策は必ず分けること（混在させない）
-- 政策は1項目ずつ配列に格納する
+- 政策は1項目ずつ配列に格納する（箇条書き・見出しの粒度で分割）
 - OCRが不鮮明・読み取り困難な箇所がある場合は needs_review: true にする
 - 候補者が見当たらない場合は candidates: [] を返す
-- 同一ページに複数候補者がいる場合はすべて抽出する"""
+- 同一ページに複数候補者がいる場合はすべて抽出する
+- 候補者名は姓名をスペースなしで連結（例：「山田太郎」）
+- 年齢・現職・元職などの肩書きはprofileに含める
+- 選挙区名・選挙名はフィールドに含めない（候補者情報のみ抽出）"""
+
+RETRY_PROMPT = """前回の抽出で一部が読み取り困難でした。
+この画像をより注意深く解析し、特に以下に気をつけてください：
+- 小さい文字・薄い文字も丁寧に読む
+- 縦書きテキストも横書きと同様に処理する
+- 候補者の区切りを正確に認識する
+
+同じJSON形式で再度抽出してください。"""
 
 
 # ─────────────────────────────────────────
 # ヘルパー関数
 # ─────────────────────────────────────────
 
-def _resize_image(img: Image.Image, max_side: int = 1568) -> Image.Image:
+def _preprocess_image(img: Image.Image) -> Image.Image:
+    """画像の前処理：コントラスト・シャープネスを強化してOCR精度を向上"""
+    img = img.convert("RGB")
+    # シャープネス強化
+    img = ImageEnhance.Sharpness(img).enhance(1.5)
+    # コントラスト強化
+    img = ImageEnhance.Contrast(img).enhance(1.2)
+    return img
+
+
+def _resize_image(img: Image.Image, max_side: int = 2048) -> Image.Image:
     """画像を OpenAI Vision の推奨最大サイズ以内にリサイズ"""
     w, h = img.size
     if max(w, h) <= max_side:
@@ -71,7 +93,7 @@ def _image_to_base64(img: Image.Image) -> str:
     """PIL 画像を data URL 形式の base64 文字列に変換"""
     buf = io.BytesIO()
     img = img.convert("RGB")
-    img.save(buf, format="JPEG", quality=90)
+    img.save(buf, format="JPEG", quality=95)
     data = base64.standard_b64encode(buf.getvalue()).decode()
     return f"data:image/jpeg;base64,{data}"
 
@@ -88,6 +110,34 @@ def _parse_json_response(text: str) -> dict:
     return json.loads(text.strip())
 
 
+def _call_api(
+    client: openai.OpenAI,
+    image_url: str,
+    user_prompt: str,
+) -> str:
+    """Vision API を呼び出してテキストを返す"""
+    response = client.chat.completions.create(
+        model="gpt-4o",
+        max_tokens=4096,
+        temperature=0,
+        response_format={"type": "json_object"},
+        messages=[
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": image_url, "detail": "high"},
+                    },
+                    {"type": "text", "text": user_prompt},
+                ],
+            },
+        ],
+    )
+    return response.choices[0].message.content or ""
+
+
 # ─────────────────────────────────────────
 # 抽出コア
 # ─────────────────────────────────────────
@@ -100,30 +150,29 @@ def _extract_from_image(
     unknown_counter: list[int],
 ) -> list[dict]:
     """単一画像から候補者情報を抽出して返す"""
+    img = _preprocess_image(img)
     img = _resize_image(img)
     image_url = _image_to_base64(img)
 
     try:
-        response = client.chat.completions.create(
-            model="gpt-4o",
-            max_tokens=4096,
-            messages=[
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "image_url",
-                            "image_url": {"url": image_url, "detail": "high"},
-                        },
-                        {"type": "text", "text": EXTRACTION_PROMPT},
-                    ],
-                },
-            ],
-        )
-        text = response.choices[0].message.content or ""
+        text = _call_api(client, image_url, EXTRACTION_PROMPT)
         parsed = _parse_json_response(text)
         candidates = parsed.get("candidates", [])
+
+        # needs_review がある場合はリトライ
+        if any(c.get("needs_review") for c in candidates):
+            print(f"\n    ↺ 精度不足を検出、再抽出中...", end=" ", flush=True)
+            retry_text = _call_api(client, image_url, RETRY_PROMPT)
+            retry_parsed = _parse_json_response(retry_text)
+            retry_candidates = retry_parsed.get("candidates", [])
+            # リトライ結果の方が候補者数が多いか、needs_reviewが減った場合は採用
+            retry_needs_review = sum(1 for c in retry_candidates if c.get("needs_review"))
+            orig_needs_review = sum(1 for c in candidates if c.get("needs_review"))
+            if retry_candidates and retry_needs_review <= orig_needs_review:
+                candidates = retry_candidates
+                print("改善")
+            else:
+                print("変化なし")
 
     except (json.JSONDecodeError, Exception) as e:
         print(f"\n  ⚠ 抽出エラー ({source_file} p.{page_num}): {e}", file=sys.stderr)
@@ -173,7 +222,7 @@ def process_file(
         for page_idx, page in enumerate(doc):
             page_num = page_idx + 1
             print(f"    ページ {page_num}/{len(doc)} ...", end=" ", flush=True)
-            pix = page.get_pixmap(dpi=150)
+            pix = page.get_pixmap(dpi=200)
             img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
             cands = _extract_from_image(client, img, file_path.name, page_num, unknown_counter)
             print(f"{len(cands)} 名")
