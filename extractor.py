@@ -1,6 +1,10 @@
 """
 extractor.py — 選挙公報から候補者情報を抽出するモジュール
-OpenAI Vision API (gpt-4o) を使用し、レイアウトに依存しない柔軟な抽出を行う。
+
+3段階パイプライン:
+  1. gpt-4o (Vision): ページ内の候補者領域を検出・切り出し
+  2. Google Cloud Vision: 各候補者領域のOCR
+  3. gpt-4o (テキスト): OCR結果を構造化
 """
 
 import base64
@@ -11,7 +15,8 @@ import sys
 from pathlib import Path
 
 import openai
-from PIL import Image, ImageEnhance, ImageFilter
+import requests
+from PIL import Image, ImageEnhance
 
 try:
     import fitz  # PyMuPDF
@@ -24,47 +29,54 @@ except ImportError:
 # プロンプト定義
 # ─────────────────────────────────────────
 
-SYSTEM_PROMPT = """あなたは選挙公報（選挙広報）の解析専門家です。
-画像から候補者情報を正確に抽出し、必ず指定のJSON形式のみで回答してください。
-レイアウトがバラバラでも柔軟に対応してください。コードブロックや説明文は不要です。
-日本語のOCRに慣れており、手書き・印刷・縦書き・横書きいずれにも対応できます。"""
+DETECT_PROMPT = """この選挙公報のページに掲載されている候補者の領域を検出してください。
 
-EXTRACTION_PROMPT = """この選挙公報の画像を解析し、候補者情報を以下のJSON形式で抽出してください。
-
-出力形式（純粋なJSONのみ。コードブロック・説明文は不要）:
+出力形式（JSONのみ）:
 {
   "candidates": [
     {
-      "name": "候補者名（判読不能な場合は「不明_1」のように連番付きで）",
-      "party": "政党名（検出できない場合はnull）",
-      "profile": "年齢・経歴・学歴・肩書き・キャッチフレーズなど人物に関する情報すべて（政策は含めない）",
-      "policies": [
-        "政策・公約・主張の項目1",
-        "政策・公約・主張の項目2"
-      ],
-      "other": "連絡先・電話番号・メール・URL・SNS・事務所住所など上記以外の情報（なければnull）",
-      "needs_review": false
+      "top": 0.0,
+      "bottom": 0.5,
+      "left": 0.0,
+      "right": 1.0
     }
   ]
 }
 
-抽出ルール:
-- 【全フィールド厳守】profile・policies・other のすべてにおいて、画像に書かれている文字を一字一句そのまま転記する。要約・言い換え・解釈・整形・補足・追加は一切禁止
+ルール:
+- top/bottom/left/right は画像全体に対する比率（0.0〜1.0）
+- 各候補者の氏名・プロフィール・政策が含まれる領域全体を囲む
+- 候補者が1人だけの場合は candidates に1件だけ返す
+- ヘッダー（選挙名・日付など）は含めない"""
+
+STRUCTURE_PROMPT = """以下は選挙公報のOCRテキストです。1名または複数名の候補者が含まれている場合があります。全員を抽出してください。
+
+OCRテキスト:
+{ocr_text}
+
+出力形式（JSONのみ）:
+{{
+  "candidates": [
+    {{
+      "name": "候補者名（読み取れない場合は null）",
+      "party": "政党名（記載なければ null）",
+      "profile": "年齢・経歴・学歴・肩書き・キャッチフレーズなど人物に関する情報すべて",
+      "policies": [
+        "政策・公約の項目をそのまま転記"
+      ],
+      "other": "連絡先・電話・メール・URL・SNS・事務所住所など（なければ null）",
+      "needs_review": false
+    }}
+  ]
+}}
+
+厳守ルール:
+- profile・policies・other はすべてOCRテキストに書かれている文字をそのまま転記する
+- 要約・言い換え・解釈・整形・補足・追加は一切禁止
 - policies は箇条書きの各項目をそのまま配列に入れる
-- profile と policies は必ず分けること
-- OCRが不鮮明・読み取り困難な箇所がある場合は needs_review: true にする
-- 候補者が見当たらない場合は candidates: [] を返す
-- 同一ページに複数候補者がいる場合はすべて抽出する
-- 候補者名は姓名をスペースなしで連結（例：「山田太郎」）
-- 選挙区名・選挙名は含めない"""
-
-RETRY_PROMPT = """前回の抽出で一部が読み取り困難でした。
-この画像をより注意深く解析し、特に以下に気をつけてください：
-- 小さい文字・薄い文字も丁寧に読む
-- 縦書きテキストも横書きと同様に処理する
-- 候補者の区切りを正確に認識する
-
-同じJSON形式で再度抽出してください。"""
+- OCRが明らかにおかしい・読み取り困難な箇所があれば needs_review: true にする
+- 選挙区名・選挙名は含めない
+- 候補者が見当たらない場合は candidates: [] を返す"""
 
 
 # ─────────────────────────────────────────
@@ -72,17 +84,15 @@ RETRY_PROMPT = """前回の抽出で一部が読み取り困難でした。
 # ─────────────────────────────────────────
 
 def _preprocess_image(img: Image.Image) -> Image.Image:
-    """画像の前処理：コントラスト・シャープネスを強化してOCR精度を向上"""
+    """画像の前処理：コントラスト・シャープネスを強化"""
     img = img.convert("RGB")
-    # シャープネス強化
     img = ImageEnhance.Sharpness(img).enhance(1.5)
-    # コントラスト強化
     img = ImageEnhance.Contrast(img).enhance(1.2)
     return img
 
 
 def _resize_image(img: Image.Image, max_side: int = 2048) -> Image.Image:
-    """画像を OpenAI Vision の推奨最大サイズ以内にリサイズ"""
+    """画像を最大サイズ以内にリサイズ"""
     w, h = img.size
     if max(w, h) <= max_side:
         return img
@@ -90,116 +100,126 @@ def _resize_image(img: Image.Image, max_side: int = 2048) -> Image.Image:
     return img.resize((int(w * ratio), int(h * ratio)), Image.LANCZOS)
 
 
-def _image_to_base64(img: Image.Image) -> str:
+def _image_to_base64_url(img: Image.Image) -> str:
     """PIL 画像を data URL 形式の base64 文字列に変換"""
     buf = io.BytesIO()
-    img = img.convert("RGB")
-    img.save(buf, format="JPEG", quality=95)
+    img.convert("RGB").save(buf, format="JPEG", quality=95)
     data = base64.standard_b64encode(buf.getvalue()).decode()
     return f"data:image/jpeg;base64,{data}"
 
 
+def _image_to_base64_raw(img: Image.Image) -> str:
+    """PIL 画像を生の base64 文字列に変換（Google Vision用）"""
+    buf = io.BytesIO()
+    img.convert("RGB").save(buf, format="PNG")
+    return base64.standard_b64encode(buf.getvalue()).decode()
+
+
 def _parse_json_response(text: str) -> dict:
     """レスポンステキストから JSON を抽出してパース"""
-    # コードブロック除去
     text = re.sub(r"```(?:json)?\s*\n?", "", text)
     text = re.sub(r"\n?```", "", text)
-    # JSON オブジェクト部分を抽出
     match = re.search(r"\{.*\}", text, re.DOTALL)
     if match:
         return json.loads(match.group())
     return json.loads(text.strip())
 
 
-def _call_api(
+# ─────────────────────────────────────────
+# Stage 1: 候補者領域の検出
+# ─────────────────────────────────────────
+
+def _detect_regions(client: openai.OpenAI, img: Image.Image) -> list[Image.Image]:
+    """gpt-4o で候補者領域を検出し、切り出した画像リストを返す"""
+    image_url = _image_to_base64_url(img)
+    w, h = img.size
+
+    response = client.chat.completions.create(
+        model="gpt-4o",
+        max_tokens=1024,
+        temperature=0,
+        response_format={"type": "json_object"},
+        messages=[
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image_url", "image_url": {"url": image_url, "detail": "high"}},
+                    {"type": "text", "text": DETECT_PROMPT},
+                ],
+            }
+        ],
+    )
+    parsed = _parse_json_response(response.choices[0].message.content or "")
+    regions = parsed.get("candidates", [])
+
+    if not regions:
+        return [img]  # 検出失敗時はページ全体を使う
+
+    crops = []
+    for r in regions:
+        pad = 0.01  # 少しパディングを追加
+        x1 = max(0, int((r.get("left", 0) - pad) * w))
+        y1 = max(0, int((r.get("top", 0) - pad) * h))
+        x2 = min(w, int((r.get("right", 1) + pad) * w))
+        y2 = min(h, int((r.get("bottom", 1) + pad) * h))
+        crops.append(img.crop((x1, y1, x2, y2)))
+
+    return crops
+
+
+# ─────────────────────────────────────────
+# Stage 2: Google Cloud Vision OCR
+# ─────────────────────────────────────────
+
+def _ocr_google_vision(google_api_key: str, img: Image.Image) -> str:
+    """Google Cloud Vision API で OCR テキストを取得"""
+    content = _image_to_base64_raw(img)
+    resp = requests.post(
+        f"https://vision.googleapis.com/v1/images:annotate?key={google_api_key}",
+        json={
+            "requests": [{
+                "image": {"content": content},
+                "features": [{"type": "DOCUMENT_TEXT_DETECTION"}],
+                "imageContext": {"languageHints": ["ja"]},
+            }]
+        },
+        timeout=30,
+    )
+    resp.raise_for_status()
+    result = resp.json()
+    annotation = result["responses"][0].get("fullTextAnnotation", {})
+    return annotation.get("text", "")
+
+
+# ─────────────────────────────────────────
+# Stage 3: テキストから構造化
+# ─────────────────────────────────────────
+
+def _structure_from_text(
     client: openai.OpenAI,
-    image_url: str,
-    user_prompt: str,
-) -> str:
-    """Vision API を呼び出してテキストを返す"""
+    ocr_text: str,
+    source_file: str,
+    page_num: int,
+    unknown_counter: list[int],
+) -> list[dict]:
+    """OCRテキストをgpt-4oで構造化して候補者dictのリストを返す"""
     response = client.chat.completions.create(
         model="gpt-4o",
         max_tokens=8192,
         temperature=0,
         response_format={"type": "json_object"},
         messages=[
-            {"role": "system", "content": SYSTEM_PROMPT},
             {
                 "role": "user",
-                "content": [
-                    {
-                        "type": "image_url",
-                        "image_url": {"url": image_url, "detail": "high"},
-                    },
-                    {"type": "text", "text": user_prompt},
-                ],
-            },
+                "content": STRUCTURE_PROMPT.format(ocr_text=ocr_text),
+            }
         ],
     )
-    return response.choices[0].message.content or ""
+    parsed = _parse_json_response(response.choices[0].message.content or "")
+    candidates = parsed.get("candidates", [])
 
-
-# ─────────────────────────────────────────
-# 抽出コア
-# ─────────────────────────────────────────
-
-def _extract_from_image(
-    client: openai.OpenAI,
-    img: Image.Image,
-    source_file: str,
-    page_num: int,
-    unknown_counter: list[int],
-) -> list[dict]:
-    """単一画像から候補者情報を抽出して返す"""
-    img = _preprocess_image(img)
-    img = _resize_image(img)
-    image_url = _image_to_base64(img)
-
-    candidates = None
-
-    # 1回目の試行
-    try:
-        text = _call_api(client, image_url, EXTRACTION_PROMPT)
-        parsed = _parse_json_response(text)
-        candidates = parsed.get("candidates", [])
-    except (json.JSONDecodeError, Exception) as e:
-        print(f"\n    ↺ パース失敗、再試行中... ({e})", end=" ", flush=True)
-
-    # パース失敗 or needs_review がある場合はリトライ
-    if candidates is None or any(c.get("needs_review") for c in candidates):
-        if candidates is not None:
-            print(f"\n    ↺ 精度不足を検出、再抽出中...", end=" ", flush=True)
-        try:
-            retry_text = _call_api(client, image_url, RETRY_PROMPT)
-            retry_parsed = _parse_json_response(retry_text)
-            retry_candidates = retry_parsed.get("candidates", [])
-            if candidates is None:
-                candidates = retry_candidates
-                print("完了")
-            else:
-                retry_needs_review = sum(1 for c in retry_candidates if c.get("needs_review"))
-                orig_needs_review = sum(1 for c in candidates if c.get("needs_review"))
-                if retry_candidates and retry_needs_review <= orig_needs_review:
-                    candidates = retry_candidates
-                    print("改善")
-                else:
-                    print("変化なし")
-        except (json.JSONDecodeError, Exception) as e2:
-            print(f"\n  ⚠ 抽出エラー ({source_file} p.{page_num}): {e2}", file=sys.stderr)
-            if candidates is None:
-                candidates = [{
-                    "name": f"不明_{unknown_counter[0]}",
-                    "party": None,
-                    "profile": "",
-                    "policies": [],
-                    "other": None,
-                    "needs_review": True,
-                }]
-                unknown_counter[0] += 1
-
-    # 「不明」候補者に連番を割り当て・共通フィールドを付与
     for cand in candidates:
-        name = cand.get("name", "")
+        name = cand.get("name") or ""
         if not name or re.match(r"^不明", name):
             cand["name"] = f"不明_{unknown_counter[0]}"
             unknown_counter[0] += 1
@@ -215,12 +235,65 @@ def _extract_from_image(
 
 
 # ─────────────────────────────────────────
+# 抽出コア（3段階パイプライン）
+# ─────────────────────────────────────────
+
+def _extract_from_image(
+    client: openai.OpenAI,
+    google_api_key: str,
+    img: Image.Image,
+    source_file: str,
+    page_num: int,
+    unknown_counter: list[int],
+) -> list[dict]:
+    """1ページ画像から3段階パイプラインで候補者情報を抽出"""
+    img = _preprocess_image(img)
+    img = _resize_image(img)
+
+    # Stage 1: 候補者領域を検出・切り出し
+    try:
+        crops = _detect_regions(client, img)
+    except Exception as e:
+        print(f"\n    ⚠ 領域検出失敗、ページ全体で処理: {e}", file=sys.stderr)
+        crops = [img]
+
+    candidates = []
+    for crop in crops:
+        try:
+            # Stage 2: Google Vision OCR
+            ocr_text = _ocr_google_vision(google_api_key, crop)
+            if not ocr_text.strip():
+                continue
+
+            # Stage 3: 構造化（1領域から複数候補者を返す場合あり）
+            cands = _structure_from_text(client, ocr_text, source_file, page_num, unknown_counter)
+            candidates.extend(cands)
+
+        except Exception as e:
+            print(f"\n    ⚠ 抽出エラー ({source_file} p.{page_num}): {e}", file=sys.stderr)
+            candidates.append({
+                "name": f"不明_{unknown_counter[0]}",
+                "party": None,
+                "profile": "",
+                "policies": [],
+                "other": None,
+                "needs_review": True,
+                "source_file": source_file,
+                "source_page": page_num,
+            })
+            unknown_counter[0] += 1
+
+    return candidates
+
+
+# ─────────────────────────────────────────
 # ファイル処理
 # ─────────────────────────────────────────
 
 def process_file(
     file_path: Path,
     client: openai.OpenAI,
+    google_api_key: str,
     unknown_counter: list[int],
 ) -> list[dict]:
     """1ファイル（PDF/画像）を処理して候補者リストを返す"""
@@ -237,7 +310,7 @@ def process_file(
             print(f"    ページ {page_num}/{len(doc)} ...", end=" ", flush=True)
             pix = page.get_pixmap(dpi=200)
             img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
-            cands = _extract_from_image(client, img, file_path.name, page_num, unknown_counter)
+            cands = _extract_from_image(client, google_api_key, img, file_path.name, page_num, unknown_counter)
             print(f"{len(cands)} 名")
             results.extend(cands)
         doc.close()
@@ -246,7 +319,7 @@ def process_file(
     elif suffix in (".jpg", ".jpeg", ".png"):
         print(f"    画像処理中 ...", end=" ", flush=True)
         img = Image.open(file_path)
-        cands = _extract_from_image(client, img, file_path.name, 1, unknown_counter)
+        cands = _extract_from_image(client, google_api_key, img, file_path.name, 1, unknown_counter)
         print(f"{len(cands)} 名")
         return cands
 
