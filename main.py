@@ -97,10 +97,10 @@ def main() -> None:
     write_index(all_candidates, OUTPUT_DIR)
 
     print(f"\n✓ 出力完了: {OUTPUT_DIR}/")
-    print(f"  candidates.json  — Q&A/RAG システム連携用")
-    print(f"  candidates.csv   — スプレッドシート確認用")
-    print(f"  candidates/      — 候補者別 Markdown（プロフィール・政策）")
-    print(f"  index.md         — 候補者一覧インデックス")
+    print(f"  candidates.json  — JSON")
+    print(f"  candidates.csv   — CSV")
+    print(f"  candidates/      — 候補者別 Markdown（プロフィール・政策・その他）")
+    print(f"  index.md         — 候補者一覧")
 
     # 要確認フラグがある候補者を表示
     needs_review = [c for c in all_candidates if c.get("needs_review")]
